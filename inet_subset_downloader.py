@@ -21,17 +21,26 @@ def parse_args():
     parser.add_argument(
         "--num-images",
         type=int,
-        default=100,
+        default=2,
         help="Number of image neighborhoods to download",
     )
     parser.add_argument(
-        "--num-neighbors", type=int, default=100, help="Number of neighbors to download"
+        "--num-neighbors",
+        type=int,
+        default=32768,
+        help="Number of neighbors to download",
     )
     parser.add_argument(
         "-indice-folder",
         type=str,
         default="./data",
         help="Folder containing the indice files",
+    )
+    parser.add_argument(
+        "--imagenet-dir",
+        type=str,
+        default="~/datasets/ILSVRC2012/val/",
+        help="Folder containing the ImageNet validation set",
     )
     parser.add_argument(
         "--output-dir",
@@ -42,7 +51,19 @@ def parse_args():
     parser.add_argument(
         "--seed", type=int, default=0, help="Random seed for reproducibility"
     )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to a file containing a list of already downloaded images",
+    )
     args = parser.parse_args()
+
+    # Expand user paths
+    args.indice_folder = os.path.expanduser(args.indice_folder)
+    args.imagenet_dir = os.path.expanduser(args.imagenet_dir)
+    args.output_dir = os.path.expanduser(args.output_dir)
+    args.resume_from = os.path.expanduser(args.resume_from)
     return args
 
 
@@ -53,12 +74,17 @@ def search_and_download(knn_service, filepath, args):
 
     url_captions = []
     multiplier = 2
-    while len(url_captions < args.num_neighbors):
+    while len(url_captions) < args.num_neighbors:
+        if multiplier > 2:
+            print("Doubling query size")
+            print("Only found", len(url_captions), "neighbors")
+        elif multiplier > 4:
+            break
         results = knn_service.query(
             image_input=image,
             modality="image",
             indice_name="laion_400m",
-            num_images=args.num_neighbors,
+            num_images=args.num_neighbors * multiplier,
             num_result_ids=args.num_neighbors * multiplier,
         )
         url_captions = pd.DataFrame(
@@ -69,10 +95,13 @@ def search_and_download(knn_service, filepath, args):
             columns=["url", "caption"],
         )
         multiplier *= 2
+    url_captions = url_captions.iloc[: min(args.num_neighbors, len(url_captions))]
 
     # Download the neighborhoods using img2dataset
     # Join the output directory and the image name to get the output path
-    out_dir = os.path.join(args.output_dir, os.path.basename(filepath))[:-4]
+    *_, class_name, image_name = filepath.split("/")
+    out_dir = os.path.join(args.output_dir, class_name, image_name)
+    out_dir = out_dir[: out_dir.rfind(".")]
     if not os.path.exists(out_dir):
         os.makedirs(out_dir)
     else:
@@ -82,7 +111,7 @@ def search_and_download(knn_service, filepath, args):
 
     # Download the images
     os.system(
-        f"img2dataset --input_format=parquet --url_list {os.path.join(out_dir, 'metadata.parquet')} --output_folder {out_dir} --processes_count=16 --thread_count=64 --output_format=webdataset --url_col=url --caption_col=caption"
+        f"img2dataset --input_format=parquet --url_list {os.path.join(out_dir, 'metadata.parquet')} --output_folder {out_dir} --processes_count=16 --thread_count=64 --output_format=webdataset --url_col=url --caption_col=caption --number_sample_per_shard 1000"
     )
 
 
@@ -91,21 +120,20 @@ def main():
     args = parse_args()
 
     # Turn ImageNet validation folder into a list of all the image paths
-    val_dir = "~/datasets/ILSVRC2012/val/"
-    val_dir = os.path.expanduser(val_dir)
+    print("Loading ImageNet validation set")
 
     val_files = []
-    for dir in os.listdir(val_dir):
-        for file in os.listdir(os.path.join(val_dir, dir)):
-            val_files.append(os.path.join(val_dir, dir, file))
+    for dir in os.listdir(args.imagenet_dir):
+        for file in os.listdir(os.path.join(args.imagenet_dir, dir)):
+            val_files.append(os.path.join(args.imagenet_dir, dir, file))
 
     # Take a random subset of the images and set seed for reproducibility
     np.random.seed(args.seed)
-    val_files = np.random.choice(val_files, args.num_images, replace=False)
+    val_files = list(np.random.choice(val_files, args.num_images, replace=False))
 
     # Load clip index and metadata provider
+    print("Loading index")
     columns = ["url", "caption"]
-    # metadata, _ = load_metadata_provider('./', True, False, 'image.index', columns, False)
     options = ClipOptions(
         indice_folder="./data",
         clip_model="ViT-B/32",
@@ -124,12 +152,19 @@ def main():
     knn_service = KnnService(clip_resources={"laion_400m": resource})
 
     # Loop through the images and download the neighborhoods and save progress to a json file
-    progress = {"all_files": val_files, "current_file": 0}
-    for i, filepath in enumerate(val_files):
-        print("Downloading neighborhood", i, "of", args.num_images)
+    if args.resume_from:
+        print("Resuming from", args.resume_from)
+        with open(args.resume_from, "r") as f:
+            progress = json.load(f)
+        val_files = progress["all_files"][progress["current_file"] :]
+    else:
+        progress = {"all_files": val_files, "current_file": 0}
+
+    for i, filepath in enumerate(val_files, start=progress["current_file"]):
+        print("Downloading neighborhood", i + 1, "of", args.num_images)
         search_and_download(knn_service, filepath, args)
-        progress["current_file"] = i
-        with open("progress.json", "w") as f:
+        progress["current_file"] = i + 1
+        with open(os.path.join(args.output_dir, "progress.json"), "w") as f:
             json.dump(progress, f)
 
 
